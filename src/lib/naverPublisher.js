@@ -313,10 +313,29 @@ async function typeAtCurrentCursor(page, text, log = () => {}, label = "입력")
 function splitKoreanSentences(text) {
   const value = String(text || "").replace(/\s+/g, " ").trim();
   if (!value) return [];
-  return value
-    .split(/(?<=[.!?。！？]|(?:다|요|죠|임|음|함|됨)\.)(?=\s+)/g)
+
+  // Match sentence-ending punctuation:
+  // - 느낌표(!), 물음표(?)
+  // - 마침표(.): 단, 숫자 뒤(1., 2., 5.15) 또는 단일 영문/한글 문자 뒤(A., 가.)는 제외
+  const rawSentences = value
+    .split(/(?<=[!?！？]|(?<!\b\d{1,4}|\b[a-zA-Z가-힣])\.)(?=\s+)/g)
     .map((item) => item.trim())
     .filter(Boolean);
+
+  // Safety merge: 혹시라도 "1.", "2)", "A." 등 번호/불릿 기호만 단독으로 쪼개진 경우 다음 문장과 즉시 병합
+  const merged = [];
+  const orphanPattern = /^(?:\d{1,4}[.)]|[가-힣a-zA-Z][.)]|[-*•■▶])\s*$/;
+
+  for (let i = 0; i < rawSentences.length; i++) {
+    const current = rawSentences[i];
+    if (orphanPattern.test(current) && i + 1 < rawSentences.length) {
+      rawSentences[i + 1] = `${current} ${rawSentences[i + 1]}`;
+    } else {
+      merged.push(current);
+    }
+  }
+
+  return merged;
 }
 
 async function typeBodyParagraph(page, text, options, log) {
@@ -2326,7 +2345,16 @@ async function publishToNaver(options) {
       "[class*='quotation'] button[aria-haspopup='true']",
       "[class*='quote'] button[aria-haspopup='true']"
     ].join(", "),
-    saveButton: "button:has-text('저장')",
+    saveButton: [
+      "button[data-click-area='tpb.save']",
+      "[data-click-area='tpb.save']",
+      "button[class*='save_btn__']",
+      "button[class*='save_btn']",
+      ".se-save-button",
+      "button:has-text('저장')",
+      ".se-header-container button:has-text('저장')",
+      ".se-toolbar button:has-text('저장')"
+    ].join(", "),
     publishButton: [
       "button[data-click-area='tpb.publish']",
       "[data-click-area='tpb.publish']",
@@ -2452,7 +2480,11 @@ async function publishToNaver(options) {
     const titleLocator = await waitForPostWriteTitle(page, selectors, options, postWriteUrl, log);
     const useExistingDraft = resumeExistingDraft && await hasExistingDraftContent(page, titleLocator);
     if (useExistingDraft) {
-      log("Naver 글쓰기 화면에 작성된 제목/본문 또는 이미지가 있어 재입력 없이 발행 단계로 이어갑니다.");
+      log("Naver 글쓰기 화면에 작성된 제목/본문 또는 이미지가 있어 재입력 없이 다음 단계로 이어갑니다.");
+      if (options.saveDraftOnly) {
+        log("임시저장(draft) 모드이며 기존 작성 내용이 확인되어 저장을 완료합니다.");
+        return { success: true, mode: "draft", title: options.title };
+      }
     } else {
       if (resumeExistingDraft) {
         log("재사용할 작성 내용이 보이지 않아 저장된 생성 결과로 다시 입력합니다.", "warn");
@@ -2490,13 +2522,26 @@ async function publishToNaver(options) {
     await assertNaverSessionActive(page, selectors, log, "본문 입력 완료");
 
     const saveButton = selectors.saveButton
-      ? await findVisibleLocator(page, selectors.saveButton, 2500).catch(() => null)
+      ? await findVisibleLocator(page, selectors.saveButton, 5000).catch(() => null)
       : null;
     if (saveButton) {
-      await assertNaverSessionActive(page, selectors, log, "저장 전");
-      await safeClickLocator(page, saveButton, log, "저장 버튼");
-      await sleep(1500);
-      await assertNaverSessionActive(page, selectors, log, "저장");
+      await assertNaverSessionActive(page, selectors, log, "임시저장 전");
+      await safeClickLocator(page, saveButton, log, "상단 임시저장 버튼");
+      log("상단 임시저장(저장) 버튼을 클릭했습니다. 서버 동기화를 위해 대기합니다...");
+      await sleep(3000);
+      await assertNaverSessionActive(page, selectors, log, "임시저장 확인");
+    } else {
+      log("상단 저장 버튼을 찾지 못해 단축키(Ctrl+S) 저장을 시도합니다.", "warn");
+      await page.keyboard.press("Control+s").catch(() => {});
+      await sleep(3000);
+    }
+
+    if (options.saveDraftOnly) {
+      log("==================================================================");
+      log(" [임시저장 완료] '저장하기(draft)' 모드로 설정되어 있어 발행을 진행하지 않고 임시저장을 완료했습니다.");
+      log(" 네이버 블로그 글쓰기 화면 우측 상단의 [저장] 목록에서 글을 검수한 후 직접 발행하실 수 있습니다.");
+      log("==================================================================");
+      return { success: true, mode: "draft", title: options.title };
     }
 
     await assertNaverSessionActive(page, selectors, log, "발행 설정 열기 전");
